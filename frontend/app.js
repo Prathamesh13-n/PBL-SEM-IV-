@@ -1,10 +1,30 @@
 /* ═══════════════════════════════════════
-   CONSTANTS & STATE
+   API CONFIG  (change BASE_URL if needed)
+═══════════════════════════════════════ */
+const API = 'http://localhost:8000';
+let apiToken = null;          // JWT from /auth/login
+
+async function api(method, path, body) {
+    const r = await fetch(`${API}${path}`, {
+        method,
+        headers: {
+            'Content-Type': 'application/json',
+            ...(apiToken ? { 'Authorization': `Bearer ${apiToken}` } : {})
+        },
+        body: body ? JSON.stringify(body) : undefined
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'API error');
+    return d;
+}
+
+/* ═══════════════════════════════════════
+   CONSTANTS  (mirror backend utils.py)
 ═══════════════════════════════════════ */
 const CITIES = { Maharashtra: ['Mumbai', 'Pune', 'Nagpur', 'Nashik'] };
 const FACILITIES = {
     Mumbai: ['Phoenix Marketcity', 'Infiniti Mall', 'R City Mall', 'High Street Phoenix'],
-    Pune: ['MIT ADT College - SOC', 'Phoenix Marketcity', 'Amanora Mall', 'Seasons Mall'],
+    Pune:   ['MIT ADT College - SOC', 'Phoenix Marketcity', 'Amanora Mall', 'Seasons Mall'],
     Nagpur: ['Empress City Mall', 'Eternity Mall', 'VR Nagpur'],
     Nashik: ['City Centre Mall', 'Nashik Central']
 };
@@ -12,58 +32,42 @@ const AREAS = {
     'MIT ADT College - SOC': ['BN', 'BS', 'ON', 'OS'],
     default: ['B1', 'B2', 'B3', 'O1', 'O2', 'O3', 'O4', 'O5']
 };
-const ENTRIES = ['North Gate', 'South Gate', 'East Gate', 'West Gate', 'Main Entrance'];
-
-const FREE_HOURS = 12;   // free plan free time
-const PAID_HOURS = 20;   // premium free time
-const FAMILY_HOURS = Infinity;
-const WARN_BEFORE = 2;    // warn 2 hours before overtime
-const FINE_FREE = 50;  // ₹/hr
-const FINE_PAID = 30;  // ₹/hr
-const FINE_FAMILY = 0;
-const AUTO_FINE_INTERVAL_HRS = 1.0; // auto-fine every 60 mins
-const ADMIN_EMAIL = 'admin@smartpark.com';
-const ADMIN_PASS = 'Admin@123';
-
-let currentUser = null;
-let isAdmin = false;
-let savedParkings = JSON.parse(localStorage.getItem('sp_parkings')) || [];
-let parkingCounter = parseInt(localStorage.getItem('sp_counter')) || 1;
-let selectedSlot = null;
-let activeFineId = null;
-let activePayFineId = null;
-let activeReParkData = null;
-let selectedPayMethod = 'upi';
-let purchaseType = 'premium';
-let activityChart = null;
-let facilityChart = null;
+const ENTRIES      = ['North Gate', 'South Gate', 'East Gate', 'West Gate', 'Main Entrance'];
+const FREE_HOURS   = 12;
+const PAID_HOURS   = 20;
+const WARN_BEFORE  = 2;
+const FINE_FREE    = 50;
+const FINE_PAID    = 30;
+const ADMIN_EMAIL  = 'admin@smartpark.com';
+const ADMIN_PASS   = 'Admin@123';
 
 /* ═══════════════════════════════════════
-   AUTH - LOGIN
+   GLOBAL STATE  (in-memory cache)
 ═══════════════════════════════════════ */
-function clearAllData() {
-    if (!confirm('Clear ALL data?')) return;
-    ['sp_users', 'sp_parkings', 'sp_counter', 'sp_currentUser'].forEach(k => localStorage.removeItem(k));
-    showToast('Data cleared. Refreshing...', 'success');
-    setTimeout(() => location.reload(), 1200);
-}
+let currentUser        = null;
+let isAdmin            = false;
+let savedParkings      = [];      // cache populated by API calls
+let selectedSlot       = null;
+let activeFineId       = null;
+let activePayFineId    = null;
+let activeReParkData   = null;
+let selectedPayMethod  = 'upi';
+let purchaseType       = 'premium';
+let activityChart      = null;
+let facilityChart      = null;
+let wsConnection       = null;
+let adminAutoRefreshInterval = null;
 
-function seedUsers() {
-    if (!localStorage.getItem('sp_users')) {
-        const defaults = [
-            { name: 'Prathamesh', email: 'prathamesh@gmail.com', pass: '1304Pra', tier: 'free', vehicles: [], family: [], premiumExpiry: null, paidFines: [] }
-        ];
-        localStorage.setItem('sp_users', JSON.stringify(defaults));
-    }
-}
-
+/* ═══════════════════════════════════════
+   AUTH — REGISTER
+═══════════════════════════════════════ */
 function fillLoginCredential(type) {
     if (type === 'user') {
-        document.getElementById('loginEmail').value = 'prathamesh@gmail.com';
+        document.getElementById('loginEmail').value    = 'prathamesh@gmail.com';
         document.getElementById('loginPassword').value = '1304Pra';
     } else {
-        document.getElementById('adminEmail').value = 'admin@smartpark.com';
-        document.getElementById('adminPass').value = 'Admin@123';
+        document.getElementById('adminEmail').value = ADMIN_EMAIL;
+        document.getElementById('adminPass').value  = ADMIN_PASS;
     }
 }
 
@@ -77,13 +81,13 @@ function switchLoginTab(t) {
     document.getElementById('loginError').style.display = 'none';
 
     if (t === 'admin') document.body.classList.add('admin-login-mode');
-    else document.body.classList.remove('admin-login-mode');
+    else               document.body.classList.remove('admin-login-mode');
 }
 
-function handleRegister() {
-    const name = (document.getElementById('regName').value || '').trim();
+async function handleRegister() {
+    const name  = (document.getElementById('regName').value || '').trim();
     const email = (document.getElementById('regEmail').value || '').trim().toLowerCase();
-    const pass = document.getElementById('regPass').value || '';
+    const pass  = document.getElementById('regPass').value  || '';
     const pass2 = document.getElementById('regPass2').value || '';
     const errEl = document.getElementById('loginError');
     errEl.style.display = 'none';
@@ -98,28 +102,22 @@ function handleRegister() {
         errEl.textContent = 'Passwords do not match.'; errEl.style.display = 'block'; return;
     }
 
-    seedUsers();
-    const users = JSON.parse(localStorage.getItem('sp_users')) || [];
-    if (users.find(u => u.email === email)) {
-        errEl.textContent = 'Email already registered. Please sign in.'; errEl.style.display = 'block'; return;
+    try {
+        const data     = await api('POST', '/auth/register', { name, email, password: pass });
+        apiToken       = data.access_token;
+        currentUser    = { ...data.user, vehicles: [], family: [] };
+        isAdmin        = false;
+        localStorage.setItem('sp_token', apiToken);
+        showToast('Account created! Welcome to SmartPark Pro 🎉', 'success');
+        initApp();
+    } catch (e) {
+        errEl.textContent = e.message; errEl.style.display = 'block';
     }
-
-    const newUser = { name, email, pass, tier: 'free', vehicles: [], family: [], premiumExpiry: null, paidFines: [] };
-    users.push(newUser);
-    saveUsers(users);
-
-    // auto-login
-    isAdmin = false;
-    currentUser = { ...newUser };
-    localStorage.setItem('sp_currentUser', JSON.stringify(currentUser));
-    showToast('Account created! Welcome to SmartPark Pro 🎉', 'success');
-    initApp();
 }
 
-function handleLogin() {
-    const emailRaw = document.getElementById('loginEmail').value || '';
-    const email = emailRaw.trim().toLowerCase();
-    const pass = document.getElementById('loginPassword').value || '';
+async function handleLogin() {
+    const email = (document.getElementById('loginEmail').value || '').trim().toLowerCase();
+    const pass  = document.getElementById('loginPassword').value || '';
     const errEl = document.getElementById('loginError');
     errEl.style.display = 'none';
 
@@ -127,62 +125,49 @@ function handleLogin() {
         errEl.textContent = 'Please enter email and password.'; errEl.style.display = 'block'; return;
     }
 
-    seedUsers();
-    const users = JSON.parse(localStorage.getItem('sp_users')) || [];
-    const user = users.find(u => u.email.toLowerCase() === email && u.pass === pass);
-
-    if (!user) {
-        errEl.textContent = 'Invalid email or password.'; errEl.style.display = 'block'; return;
+    try {
+        const data  = await api('POST', '/auth/login', { email, password: pass });
+        apiToken    = data.access_token;
+        currentUser = { ...data.user, vehicles: [], family: [] };
+        isAdmin     = false;
+        localStorage.setItem('sp_token', apiToken);
+        initApp();
+    } catch (e) {
+        errEl.textContent = e.message || 'Invalid email or password.';
+        errEl.style.display = 'block';
     }
-
-    // Check premium expiry
-    if ((user.tier === 'premium' || user.tier === 'family') && user.premiumExpiry && Date.now() > user.premiumExpiry) {
-        user.tier = 'free'; saveUsers(users);
-    }
-
-    isAdmin = false;
-    currentUser = { ...user };
-    localStorage.setItem('sp_currentUser', JSON.stringify(currentUser));
-    initApp();
 }
 
-function handleAdminLogin() {
+async function handleAdminLogin() {
     const email = (document.getElementById('adminEmail').value || '').trim().toLowerCase();
-    const pass = document.getElementById('adminPass').value || '';
+    const pass  = document.getElementById('adminPass').value || '';
     const errEl = document.getElementById('loginError');
     errEl.style.display = 'none';
 
-    if (email === ADMIN_EMAIL && pass === ADMIN_PASS) {
-        isAdmin = true;
-        currentUser = { name: 'Admin', email: ADMIN_EMAIL, tier: 'admin', vehicles: [], family: [] };
-        localStorage.setItem('sp_currentUser', JSON.stringify(currentUser));
+    try {
+        const data  = await api('POST', '/auth/admin-login', { email, password: pass });
+        apiToken    = data.access_token;
+        currentUser = { ...data.user, vehicles: [], family: [] };
+        isAdmin     = true;
+        localStorage.setItem('sp_token', apiToken);
         initApp();
-    } else {
+    } catch (e) {
         errEl.textContent = 'Invalid admin credentials.'; errEl.style.display = 'block';
     }
 }
 
 function logout() {
     if (!confirm('Logout from SmartPark?')) return;
-    localStorage.removeItem('sp_currentUser');
+    apiToken    = null;
+    currentUser = null;
+    savedParkings = [];
+    localStorage.removeItem('sp_token');
+    if (wsConnection) { wsConnection.close(); wsConnection = null; }
     location.reload();
 }
 
-function saveUsers(users) {
-    localStorage.setItem('sp_users', JSON.stringify(users));
-}
-
-function updateUserInStorage(updates) {
-    seedUsers();
-    const all = JSON.parse(localStorage.getItem('sp_users')) || [];
-    const idx = all.findIndex(u => u.email === currentUser.email);
-    if (idx !== -1) { Object.assign(all[idx], updates); saveUsers(all); }
-    Object.assign(currentUser, updates);
-    localStorage.setItem('sp_currentUser', JSON.stringify(currentUser));
-}
-
 /* ═══════════════════════════════════════
-   INIT APP (splash → main UI)
+   INIT APP  (splash → main UI)
 ═══════════════════════════════════════ */
 function initApp() {
     document.body.classList.remove('admin-mode', 'admin-login-mode');
@@ -230,7 +215,7 @@ function initApp() {
     }, 2200);
 }
 
-function bootAppUI() {
+async function bootAppUI() {
     document.getElementById('userName').textContent = currentUser.name;
     const av = document.getElementById('userAvatar');
     const tb = document.getElementById('tierBadge');
@@ -240,21 +225,40 @@ function bootAppUI() {
         tb.textContent = 'Admin'; tb.className = 'tier-badge tier-gold';
         document.querySelectorAll('.admin-only').forEach(el => el.classList.remove('hidden'));
         showSection('admin', document.querySelector('[data-sec="admin"]'));
-        checkOvertimeNotifications();
+        connectWebSocket();
         startAdminAutoRefresh();
     } else {
-        const isFamily = currentUser.tier === 'family';
+        // Load vehicles + premium status from backend
+        await refreshUserData();
+
+        const isFamily  = currentUser.tier === 'family';
         const isPremium = currentUser.tier === 'premium';
         if (isFamily || isPremium) av.classList.add('premium');
-        if (isFamily) { tb.textContent = 'Family'; tb.className = 'tier-badge tier-gold'; }
-        else if (isPremium) { tb.textContent = 'Premium'; tb.className = 'tier-badge tier-premium'; }
-        else { tb.textContent = 'Free'; tb.className = 'tier-badge tier-free'; }
+        if (isFamily)      { tb.textContent = 'Family';  tb.className = 'tier-badge tier-gold'; }
+        else if (isPremium){ tb.textContent = 'Premium'; tb.className = 'tier-badge tier-premium'; }
+        else               { tb.textContent = 'Free';    tb.className = 'tier-badge tier-free'; }
 
-        loadVehiclesSelect();
-        loadDashboard();
-        checkOvertimeNotifications();
-        startAutoFineTimer();
+        await loadVehiclesSelect();
+        await loadDashboard();
+        connectWebSocket();
         setInterval(checkOvertimeNotifications, 60000);
+    }
+}
+
+// Fetch vehicles + premium status from backend and populate currentUser cache
+async function refreshUserData() {
+    try {
+        const [meData, vehicles, premStatus] = await Promise.all([
+            api('GET', '/auth/me'),
+            api('GET', '/vehicles'),
+            api('GET', '/premium/status')
+        ]);
+        currentUser.tier           = meData.tier;
+        currentUser.premium_expiry = meData.premium_expiry;
+        currentUser.vehicles       = vehicles;                        // [{id,number,type,name}]
+        currentUser.family         = premStatus.family_members || []; // [{id,name,email}]
+    } catch (e) {
+        console.warn('refreshUserData error:', e);
     }
 }
 
@@ -263,14 +267,14 @@ function bootAppUI() {
 ═══════════════════════════════════════ */
 const SEC_TITLES = {
     dashboard: ['Dashboard', 'Welcome back! Here\'s your parking overview'],
-    parking: ['Save Parking', 'Select your location and slot'],
-    find: ['Find My Car', 'GPS navigation to your vehicle'],
-    vehicles: ['My Vehicles', 'Manage your registered vehicles'],
-    active: ['Active Sessions', 'Your current parkings'],
-    history: ['Parking History', 'Your past parking records'],
-    premium: ['Premium Plans', 'Unlock premium features'],
-    admin: ['Admin Panel', 'Manage parkings & fines'],
-    slotmap: ['Live Slot Map', 'Real-time slot availability viewer']
+    parking:   ['Save Parking', 'Select your location and slot'],
+    find:      ['Find My Car', 'GPS navigation to your vehicle'],
+    vehicles:  ['My Vehicles', 'Manage your registered vehicles'],
+    active:    ['Active Sessions', 'Your current parkings'],
+    history:   ['Parking History', 'Your past parking records'],
+    premium:   ['Premium Plans', 'Unlock premium features'],
+    admin:     ['Admin Panel', 'Manage parkings & fines'],
+    slotmap:   ['Live Slot Map', 'Real-time slot availability viewer']
 };
 
 function showSection(sec, el) {
@@ -284,63 +288,73 @@ function showSection(sec, el) {
     document.getElementById('pageSub').textContent = sub;
 
     if (sec === 'dashboard') loadDashboard();
-    if (sec === 'find') loadFindCar();
-    if (sec === 'vehicles') loadVehicles();
-    if (sec === 'active') loadActiveParkings();
-    if (sec === 'history') loadHistory();
-    if (sec === 'premium') loadPremium();
-    if (sec === 'admin') loadAdmin();
-    if (sec === 'slotmap') { adminUpdateFacilities(); renderSlotMapStats(); }
+    if (sec === 'find')      loadFindCar();
+    if (sec === 'vehicles')  loadVehicles();
+    if (sec === 'active')    loadActiveParkings();
+    if (sec === 'history')   loadHistory();
+    if (sec === 'premium')   loadPremium();
+    if (sec === 'admin')     loadAdmin();
+    if (sec === 'slotmap')   { adminUpdateFacilities(); renderSlotMapStats(); }
 }
 
 /* ═══════════════════════════════════════
    DASHBOARD
 ═══════════════════════════════════════ */
-function loadDashboard() {
-    const mine = savedParkings.filter(p => p.email === currentUser.email);
-    const active = mine.filter(p => !p.endTime);
-    document.getElementById('sTotalP').textContent = mine.length;
-    document.getElementById('sActiveP').textContent = active.length;
-    document.getElementById('sVehicles').textContent = currentUser.vehicles?.length || 0;
+async function loadDashboard() {
+    try {
+        const [active, history] = await Promise.all([
+            api('GET', '/parkings/active'),
+            api('GET', '/parkings/history')
+        ]);
+        const mine = [...active, ...history];
+        // Update cache so charts and find-car still work
+        savedParkings = [...active, ...history];
 
-    const tierLabel = currentUser.tier === 'premium' ? '⭐ Premium' : currentUser.tier === 'family' ? '👨‍👩‍👧 Family' : 'Free';
-    document.getElementById('sTier').textContent = tierLabel;
+        document.getElementById('sTotalP').textContent   = mine.length;
+        document.getElementById('sActiveP').textContent  = active.length;
+        document.getElementById('sVehicles').textContent = currentUser.vehicles?.length || 0;
 
-    // Premium banner
-    const pb = document.getElementById('premiumBanner');
-    if (currentUser.tier === 'premium') {
-        pb.classList.remove('hidden');
-        document.getElementById('premiumBannerIcon').textContent = '⭐';
-        document.getElementById('premiumBannerTitle').textContent = 'Premium Plan Active';
-        document.getElementById('premiumBannerDesc').textContent = '20h free parking • ₹300/hr overtime fine';
-    } else if (currentUser.tier === 'family') {
-        pb.classList.remove('hidden');
-        document.getElementById('premiumBannerIcon').textContent = '👨‍👩‍👧';
-        document.getElementById('premiumBannerTitle').textContent = 'Family Pack Active';
-        document.getElementById('premiumBannerDesc').textContent = '♾️ Unlimited parking • Zero fines ever';
-        pb.style.background = 'linear-gradient(135deg,rgba(255,215,0,0.12),rgba(255,140,0,0.08))';
-        pb.style.borderColor = 'rgba(255,215,0,0.4)';
-    } else {
-        pb.classList.add('hidden');
-    }
+        const tierLabel = currentUser.tier === 'premium' ? '⭐ Premium'
+                        : currentUser.tier === 'family'  ? '👨‍👩‍👧 Family' : 'Free';
+        document.getElementById('sTier').textContent = tierLabel;
 
-    // Outstanding fines banner
-    const totalUnpaidFine = mine.filter(p => p.fine > 0 && !p.finePaid).reduce((s, p) => s + (p.fine || 0), 0);
-    const ofb = document.getElementById('outstandingFinesBanner');
-    if (totalUnpaidFine > 0) {
-        ofb.classList.remove('hidden');
-        document.getElementById('outstandingFinesAmt').textContent = `Total outstanding: ₹${totalUnpaidFine}`;
-    } else {
-        ofb.classList.add('hidden');
-    }
+        // Premium banner
+        const pb = document.getElementById('premiumBanner');
+        if (currentUser.tier === 'premium') {
+            pb.classList.remove('hidden');
+            document.getElementById('premiumBannerIcon').textContent  = '⭐';
+            document.getElementById('premiumBannerTitle').textContent = 'Premium Plan Active';
+            document.getElementById('premiumBannerDesc').textContent  = '20h free parking • ₹300/hr overtime fine';
+        } else if (currentUser.tier === 'family') {
+            pb.classList.remove('hidden');
+            document.getElementById('premiumBannerIcon').textContent  = '👨‍👩‍👧';
+            document.getElementById('premiumBannerTitle').textContent = 'Family Pack Active';
+            document.getElementById('premiumBannerDesc').textContent  = '♾️ Unlimited parking • Zero fines ever';
+            pb.style.background    = 'linear-gradient(135deg,rgba(255,215,0,0.12),rgba(255,140,0,0.08))';
+            pb.style.borderColor   = 'rgba(255,215,0,0.4)';
+        } else {
+            pb.classList.add('hidden');
+        }
 
-    buildActivityChart(mine);
-    buildFacilityChart(mine);
+        // Outstanding fines banner
+        const totalUnpaid = active.filter(p => p.fine > 0 && !p.finePaid).reduce((s, p) => s + (p.fine || 0), 0);
+        const ofb = document.getElementById('outstandingFinesBanner');
+        if (totalUnpaid > 0) {
+            ofb.classList.remove('hidden');
+            document.getElementById('outstandingFinesAmt').textContent = `Total outstanding: ₹${totalUnpaid}`;
+        } else {
+            ofb.classList.add('hidden');
+        }
 
-    const ra = document.getElementById('recentActivity');
-    const recent = [...mine].reverse().slice(0, 5);
-    if (!recent.length) { ra.innerHTML = '<div style="text-align:center;padding:40px;color:var(--muted)">No recent activity</div>'; return; }
-    ra.innerHTML = recent.map(p => `
+        buildActivityChart(mine);
+        buildFacilityChart(mine);
+
+        const ra = document.getElementById('recentActivity');
+        const recent = [...mine].reverse().slice(0, 5);
+        if (!recent.length) {
+            ra.innerHTML = '<div style="text-align:center;padding:40px;color:var(--muted)">No recent activity</div>'; return;
+        }
+        ra.innerHTML = recent.map(p => `
     <div style="padding:14px 0;border-bottom:1px solid var(--border2);display:flex;justify-content:space-between;align-items:center;gap:10px">
       <div>
         <div style="font-weight:600;font-size:14px">${p.vehicle?.name || 'Vehicle'} – ${p.facility}</div>
@@ -348,6 +362,9 @@ function loadDashboard() {
       </div>
       <span class="badge ${p.endTime ? 'badge-done' : 'badge-active'}">${p.endTime ? 'Done' : 'Active'}</span>
     </div>`).join('');
+    } catch (e) {
+        console.error('loadDashboard error:', e);
+    }
 }
 
 function buildActivityChart(parkings) {
@@ -383,14 +400,17 @@ function buildFacilityChart(parkings) {
 /* ═══════════════════════════════════════
    VEHICLES
 ═══════════════════════════════════════ */
-function loadVehicles() {
+async function loadVehicles() {
     const list = document.getElementById('vehiclesList');
-    const veh = currentUser.vehicles || [];
-    if (!veh.length) {
-        list.innerHTML = `<div style="text-align:center;padding:50px 20px;color:var(--muted)"><div style="font-size:48px;margin-bottom:16px">🚗</div><p>No vehicles added yet</p><button class="btn btn-primary" style="margin-top:16px" onclick="openModal('addVehicleModal')">+ Add First Vehicle</button></div>`;
-        return;
-    }
-    list.innerHTML = veh.map((v, i) => `
+    try {
+        const veh = await api('GET', '/vehicles');
+        currentUser.vehicles = veh;
+
+        if (!veh.length) {
+            list.innerHTML = `<div style="text-align:center;padding:50px 20px;color:var(--muted)"><div style="font-size:48px;margin-bottom:16px">🚗</div><p>No vehicles added yet</p><button class="btn btn-primary" style="margin-top:16px" onclick="openModal('addVehicleModal')">+ Add First Vehicle</button></div>`;
+            return;
+        }
+        list.innerHTML = veh.map(v => `
     <div class="vehicle-item">
       <div style="display:flex;align-items:center;gap:14px">
         <div class="vehicle-icon">${v.type === 'car' ? '🚗' : v.type === 'bike' ? '🏍️' : '🚛'}</div>
@@ -399,49 +419,60 @@ function loadVehicles() {
           <div style="font-family:'Space Mono',monospace;font-size:12px;color:var(--muted);margin-top:3px">${v.number}</div>
         </div>
       </div>
-      <button class="btn btn-danger btn-sm" onclick="removeVehicle(${i})">Remove</button>
+      <button class="btn btn-danger btn-sm" onclick="removeVehicle(${v.id})">Remove</button>
     </div>`).join('');
+    } catch (e) {
+        list.innerHTML = `<div style="text-align:center;padding:30px;color:var(--muted)">Error loading vehicles</div>`;
+    }
 }
 
-function loadVehiclesSelect() {
-    const sel = document.getElementById('selectedVehicle');
-    const veh = currentUser.vehicles || [];
-    sel.innerHTML = '<option value="">Select Vehicle</option>' + veh.map((v, i) => `<option value="${i}">${v.type === 'car' ? '🚗' : v.type === 'bike' ? '🏍️' : '🚛'} ${v.name} (${v.number})</option>`).join('');
+async function loadVehiclesSelect() {
+    try {
+        const veh = await api('GET', '/vehicles');
+        currentUser.vehicles = veh;
+        const sel = document.getElementById('selectedVehicle');
+        sel.innerHTML = '<option value="">Select Vehicle</option>' +
+            veh.map(v => `<option value="${v.id}">${v.type === 'car' ? '🚗' : v.type === 'bike' ? '🏍️' : '🚛'} ${v.name} (${v.number})</option>`).join('');
+    } catch (e) {
+        console.error('loadVehiclesSelect error:', e);
+    }
 }
 
-function addVehicle() {
+async function addVehicle() {
     const number = document.getElementById('vehicleNumber').value.trim().toUpperCase();
-    const type = document.getElementById('vehicleType').value;
-    const name = document.getElementById('vehicleName').value.trim() || `My ${type}`;
+    const type   = document.getElementById('vehicleType').value;
+    const name   = document.getElementById('vehicleName').value.trim() || `My ${type}`;
     if (!number) { showToast('Enter vehicle number', 'error'); return; }
 
-    const maxVehicles = (currentUser.tier === 'premium' || currentUser.tier === 'family') ? 5 : 1;
-    if ((currentUser.vehicles || []).length >= maxVehicles) {
-        showToast(`${currentUser.tier === 'free' ? 'Free plan allows 1 vehicle' : 'Max 5 vehicles'}. Upgrade for more!`, 'warning'); return;
+    try {
+        await api('POST', '/vehicles', { number, type, name });
+        closeModal('addVehicleModal');
+        document.getElementById('vehicleNumber').value = '';
+        document.getElementById('vehicleName').value   = '';
+        showToast(`✅ ${name} added!`, 'success');
+        await loadVehicles();
+        await loadVehiclesSelect();
+        loadDashboard();
+    } catch (e) {
+        showToast(e.message, 'error');
     }
-    if ((currentUser.vehicles || []).some(v => v.number === number)) { showToast('Vehicle already registered', 'error'); return; }
-
-    const v = { number, type, name };
-    if (!currentUser.vehicles) currentUser.vehicles = [];
-    currentUser.vehicles.push(v);
-    updateUserInStorage({ vehicles: currentUser.vehicles });
-    closeModal('addVehicleModal');
-    document.getElementById('vehicleNumber').value = '';
-    document.getElementById('vehicleName').value = '';
-    showToast(`✅ ${name} added!`, 'success');
-    loadVehicles(); loadVehiclesSelect(); loadDashboard();
 }
 
-function removeVehicle(i) {
+async function removeVehicle(vehicleId) {
     if (!confirm('Remove this vehicle?')) return;
-    currentUser.vehicles.splice(i, 1);
-    updateUserInStorage({ vehicles: currentUser.vehicles });
-    showToast('Vehicle removed', 'success');
-    loadVehicles(); loadVehiclesSelect(); loadDashboard();
+    try {
+        await api('DELETE', `/vehicles/${vehicleId}`);
+        showToast('Vehicle removed', 'success');
+        await loadVehicles();
+        await loadVehiclesSelect();
+        loadDashboard();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
 }
 
 /* ═══════════════════════════════════════
-   LOCATION SELECTS
+   LOCATION SELECTS  (unchanged)
 ═══════════════════════════════════════ */
 function updateCities() {
     const st = document.getElementById('state').value;
@@ -469,23 +500,31 @@ function updateAreas() {
     en.innerHTML = '<option value="">Select Entry Gate</option>' + ENTRIES.map(e => `<option value="${e}">${e}</option>`).join('');
 }
 
-function updateSlots() {
+/* ═══════════════════════════════════════
+   SLOT MAP  — fetch live data from API
+═══════════════════════════════════════ */
+async function updateSlots() {
     const area = document.getElementById('area').value;
-    const fac = document.getElementById('facility').value;
+    const fac  = document.getElementById('facility').value;
     const container = document.getElementById('parkingMapContainer');
     if (!area || !fac) { container.classList.add('hidden'); return; }
     container.classList.remove('hidden');
     document.getElementById('currentArea').textContent = area;
 
-    const occupied = new Set(savedParkings.filter(p => !p.endTime && p.facility === fac && p.area === area).map(p => p.slot));
-    let html = '';
-    for (let i = 1; i <= 50; i++) {
-        const occ = occupied.has(i);
-        html += `<div class="parking-slot${occ ? ' occupied' : ''}" id="slot-${i}" ${occ ? '' : 'onclick="selectSlot(' + i + ')"'}>${i}</div>`;
+    try {
+        const data = await api('GET', `/slots/${encodeURIComponent(fac)}/${encodeURIComponent(area)}`);
+        const occupied = new Set(data.occupied);
+        let html = '';
+        for (let i = 1; i <= 50; i++) {
+            const occ = occupied.has(i);
+            html += `<div class="parking-slot${occ ? ' occupied' : ''}" id="slot-${i}" ${occ ? '' : 'onclick="selectSlot(' + i + ')"'}>${i}</div>`;
+        }
+        document.getElementById('parkingGrid').innerHTML = html;
+        selectedSlot = null;
+        document.getElementById('selectedSlotInfo').style.display = 'none';
+    } catch (e) {
+        console.error('updateSlots error:', e);
     }
-    document.getElementById('parkingGrid').innerHTML = html;
-    selectedSlot = null;
-    document.getElementById('selectedSlotInfo').style.display = 'none';
 }
 
 function selectSlot(n) {
@@ -500,62 +539,43 @@ function selectSlot(n) {
 /* ═══════════════════════════════════════
    SAVE PARKING
 ═══════════════════════════════════════ */
-function saveParking() {
-    const vi = document.getElementById('selectedVehicle').value;
-    const state = document.getElementById('state').value;
-    const city = document.getElementById('city').value;
-    const fac = document.getElementById('facility').value;
-    const area = document.getElementById('area').value;
-    const entry = document.getElementById('entry').value;
+async function saveParking() {
+    const vehicleId = document.getElementById('selectedVehicle').value;  // vehicle ID (from API)
+    const state     = document.getElementById('state').value;
+    const city      = document.getElementById('city').value;
+    const fac       = document.getElementById('facility').value;
+    const area      = document.getElementById('area').value;
+    const entry     = document.getElementById('entry').value;
 
-    if (!vi || !state || !city || !fac || !area || !selectedSlot || !entry) {
+    if (!vehicleId || !state || !city || !fac || !area || !selectedSlot || !entry) {
         showToast('Please fill all fields and select a parking slot', 'error'); return;
     }
 
-    const slotTaken = savedParkings.some(p => !p.endTime && p.facility === fac && p.area === area && p.slot === selectedSlot);
-    if (slotTaken) { showToast(`❌ Slot ${area}-${selectedSlot} already occupied.`, 'error'); updateSlots(); return; }
-
-    const vehicle = currentUser.vehicles[vi];
-    const vehicleAlreadyParked = savedParkings.some(p => !p.endTime && p.vehicle.number === vehicle.number);
-    if (vehicleAlreadyParked) { showToast(`❌ ${vehicle.number} is already parked!`, 'error'); return; }
-
-    const myActive = savedParkings.filter(p => !p.endTime && p.email === currentUser.email);
-    const isFamily = currentUser.tier === 'family';
-    const isPremium = currentUser.tier === 'premium';
-    const maxAllowed = isFamily ? Math.min((currentUser.family || []).length + 1, 3) : isPremium ? 5 : 1;
-
-    if (myActive.length >= maxAllowed) {
-        showToast(`❌ Limit reached (${maxAllowed} active slots for your plan).`, 'error'); return;
+    try {
+        const parking = await api('POST', '/parkings', {
+            vehicle_id: parseInt(vehicleId),
+            state, city, facility: fac, area,
+            slot: selectedSlot, entry
+        });
+        showToast(`✅ Parking ${parking.id} saved!`, 'success');
+        showTicketModal(parking);
+        // Refresh slot map to mark slot as occupied
+        await updateSlots();
+        loadDashboard();
+        selectedSlot = null;
+    } catch (e) {
+        showToast(e.message, 'error');
+        await updateSlots();
     }
-
-    const id = `PKG${String(parkingCounter).padStart(6, '0')}`;
-    const parking = {
-        id, email: currentUser.email, userName: currentUser.name,
-        vehicle, state, city, facility: fac, area, slot: selectedSlot, entry,
-        time: Date.now(), endTime: null, fine: 0, fineReason: '', finePaid: false,
-        userTier: currentUser.tier, autoFineApplied: 0,
-        notified10h: false, notified20h: false, notifiedOvertime: false
-    };
-
-    savedParkings.push(parking);
-    localStorage.setItem('sp_parkings', JSON.stringify(savedParkings));
-    parkingCounter++;
-    localStorage.setItem('sp_counter', parkingCounter);
-
-    showToast(`✅ Parking ${id} saved!`, 'success');
-    showTicketModal(parking);
-    loadDashboard();
-    selectedSlot = null;
-    setTimeout(() => updateSlots(), 300);
 }
 
 /* ═══════════════════════════════════════
-   TICKET MODAL
+   TICKET MODAL  (unchanged — pure UI)
 ═══════════════════════════════════════ */
 function showTicketModal(p) {
-    document.getElementById('tId').textContent = p.id;
+    document.getElementById('tId').textContent   = p.id;
     document.getElementById('tTime').textContent = new Date(p.time).toLocaleString();
-    document.getElementById('tBody').innerHTML = `
+    document.getElementById('tBody').innerHTML   = `
     <div class="ticket-row"><span class="tkey">Facility</span><span class="tval">${p.facility}</span></div>
     <div class="ticket-row"><span class="tkey">Location</span><span class="tval">${p.area}-${p.slot}</span></div>
     <div class="ticket-row"><span class="tkey">Entry Gate</span><span class="tval">${p.entry}</span></div>
@@ -577,20 +597,23 @@ function showTicketModal(p) {
 /* ═══════════════════════════════════════
    FIND MY CAR
 ═══════════════════════════════════════ */
-function loadFindCar() {
-    const active = savedParkings.filter(p => !p.endTime && p.email === currentUser.email);
-    const container = document.getElementById('findCarContent');
+async function loadFindCar() {
+    try {
+        const active = await api('GET', '/parkings/active');
+        // Keep cache in sync for buildNavigationMap
+        savedParkings = [...active, ...savedParkings.filter(p => p.endTime)];
 
-    if (!active.length) {
-        container.innerHTML = `<div class="card" style="text-align:center;padding:60px 20px"><div style="font-size:56px;margin-bottom:16px">🚗</div><p style="color:var(--muted);margin-bottom:16px">No active parking sessions</p><button class="btn btn-primary" onclick="showSection('parking',null)">+ Save a Parking First</button></div>`;
-        return;
-    }
+        const container = document.getElementById('findCarContent');
+        if (!active.length) {
+            container.innerHTML = `<div class="card" style="text-align:center;padding:60px 20px"><div style="font-size:56px;margin-bottom:16px">🚗</div><p style="color:var(--muted);margin-bottom:16px">No active parking sessions</p><button class="btn btn-primary" onclick="showSection('parking',null)">+ Save a Parking First</button></div>`;
+            return;
+        }
 
-    container.innerHTML = active.map(p => {
-        const freeH = p.userTier === 'family' ? Infinity : (p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS);
-        const hrs = ((Date.now() - p.time) / 3600000);
-        const hrsLeft = p.userTier === 'family' ? '♾️' : Math.max(0, freeH - hrs).toFixed(1) + 'h left';
-        return `
+        container.innerHTML = active.map(p => {
+            const freeH    = p.userTier === 'family' ? Infinity : (p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS);
+            const hrs      = ((Date.now() - p.time) / 3600000);
+            const hrsLeft  = p.userTier === 'family' ? '♾️' : Math.max(0, freeH - hrs).toFixed(1) + 'h left';
+            return `
     <div class="card card-glow" style="margin-bottom:20px">
       <div style="display:flex;justify-content:space-between;align-items:start;flex-wrap:wrap;gap:10px;margin-bottom:20px">
         <div>
@@ -621,9 +644,12 @@ function loadFindCar() {
       </div>
       <button class="btn btn-ghost" style="width:100%;justify-content:center" onclick='showTicketModal(${JSON.stringify(p).replace(/\\/g, "\\\\").replace(/'/g, "\\'")} )'>🎫 View Full Ticket</button>
     </div>`;
-    }).join('');
+        }).join('');
 
-    active.forEach(p => startParkingTimer(p));
+        active.forEach(p => startParkingTimer(p));
+    } catch (e) {
+        console.error('loadFindCar error:', e);
+    }
 }
 
 function buildNavigationMap(p) {
@@ -671,10 +697,10 @@ function buildNavigationMap(p) {
 
 function buildDirectionSteps(p) {
     const steps = [
-        { icon: '🚶', title: `Enter via ${p.entry}`, desc: 'Use this gate to enter the facility' },
-        { icon: '🧭', title: `Head to Area ${p.area}`, desc: 'Follow the area signs' },
-        { icon: '📍', title: `Find Slot ${p.slot}`, desc: `Your vehicle is at slot ${p.area}-${p.slot}` },
-        { icon: '🚗', title: 'Your vehicle is here!', desc: `${p.vehicle.name} — ${p.vehicle.number}` }
+        { icon: '🚶', title: `Enter via ${p.entry}`,     desc: 'Use this gate to enter the facility' },
+        { icon: '🧭', title: `Head to Area ${p.area}`,   desc: 'Follow the area signs' },
+        { icon: '📍', title: `Find Slot ${p.slot}`,      desc: `Your vehicle is at slot ${p.area}-${p.slot}` },
+        { icon: '🚗', title: 'Your vehicle is here!',    desc: `${p.vehicle.name} — ${p.vehicle.number}` }
     ];
     return steps.map((s, i) => `
     <div style="display:flex;align-items:start;gap:14px;margin-bottom:12px">
@@ -694,13 +720,13 @@ function startParkingTimer(p) {
         const h = Math.floor(elapsed / 3600000);
         const m = Math.floor((elapsed % 3600000) / 60000);
         const s = Math.floor((elapsed % 60000) / 1000);
-        const str = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+        const str = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
         if (p.userTier === 'family') {
             el.textContent = '♾️ ' + str; el.className = 'timer-display';
         } else {
             const freeH = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
-            el.textContent = str;
-            el.className = 'timer-display' + (h >= freeH ? ' danger' : h >= (freeH - WARN_BEFORE) ? ' warning' : '');
+            el.textContent  = str;
+            el.className    = 'timer-display' + (h >= freeH ? ' danger' : h >= (freeH - WARN_BEFORE) ? ' warning' : '');
         }
     }
     tick();
@@ -708,27 +734,31 @@ function startParkingTimer(p) {
 }
 
 /* ═══════════════════════════════════════
-   ACTIVE PARKINGS (with fine payment UI)
+   ACTIVE PARKINGS
 ═══════════════════════════════════════ */
-function loadActiveParkings() {
-    const active = savedParkings.filter(p => !p.endTime && p.email === currentUser.email);
+async function loadActiveParkings() {
     const c = document.getElementById('activeParkingsList');
-    if (!active.length) { c.innerHTML = '<div style="text-align:center;padding:50px;color:var(--muted)">No active parking sessions</div>'; return; }
+    try {
+        const active = await api('GET', '/parkings/active');
+        // Update cache
+        savedParkings = [...active, ...savedParkings.filter(p => p.endTime)];
 
-    c.innerHTML = active.map(p => {
-        const hrs = ((Date.now() - p.time) / 3600000);
-        const isFamily = p.userTier === 'family';
-        const freeH = isFamily ? Infinity : (p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS);
-        const warnH = freeH - WARN_BEFORE;
-        const overtime = !isFamily && hrs > freeH;
-        const nearLimit = !isFamily && !overtime && hrs >= warnH;
-        const otHrs = overtime ? Math.max(0, hrs - freeH) : 0;
-        const finePH = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
-        const autoFine = overtime ? Math.ceil(otHrs) * finePH : 0;
-        const totalFine = (p.fine || 0) + autoFine;
-        const timeLeft = isFamily ? '♾️' : overtime ? `${Math.abs(otHrs).toFixed(1)}h overtime` : `${(freeH - hrs).toFixed(1)}h remaining`;
-
-        return `
+        if (!active.length) {
+            c.innerHTML = '<div style="text-align:center;padding:50px;color:var(--muted)">No active parking sessions</div>'; return;
+        }
+        c.innerHTML = active.map(p => {
+            const hrs      = ((Date.now() - p.time) / 3600000);
+            const isFamily = p.userTier === 'family';
+            const freeH    = isFamily ? Infinity : (p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS);
+            const warnH    = freeH - WARN_BEFORE;
+            const overtime = !isFamily && hrs > freeH;
+            const nearLimit= !isFamily && !overtime && hrs >= warnH;
+            const otHrs    = overtime ? Math.max(0, hrs - freeH) : 0;
+            const finePH   = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
+            const autoFine = overtime ? Math.ceil(otHrs) * finePH : 0;
+            const totalFine= (p.fine || 0) + autoFine;
+            const timeLeft = isFamily ? '♾️' : overtime ? `${Math.abs(otHrs).toFixed(1)}h overtime` : `${(freeH - hrs).toFixed(1)}h remaining`;
+            return `
     <div class="parking-item" style="${overtime ? 'border-color:rgba(255,23,68,0.4);' : ''}${nearLimit ? 'border-color:rgba(255,171,0,0.4);' : ''}">
       ${nearLimit && !overtime ? `<div class="warning-banner">⚠️ Only ${(freeH - hrs).toFixed(1)}h left before overtime fines apply at ₹${finePH}/hr!</div>` : ''}
       ${overtime ? `<div class="fine-banner" style="color:var(--red)">
@@ -760,38 +790,25 @@ function loadActiveParkings() {
         <button class="btn btn-danger btn-sm" onclick="openPayFineModal('${p.id}')">💳 Pay Fine Now</button>
       </div>` : ''}
       <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
-        <button class="btn btn-ghost btn-sm" onclick='showTicketModal(${JSON.stringify(p).replace(/'/g, "\\'")} )'>🎫 Ticket</button>
+        <button class="btn btn-ghost btn-sm" onclick='showTicketModal(${JSON.stringify(p).replace(/'/g,"\\'")} )'>🎫 Ticket</button>
         <button class="btn btn-success btn-sm" onclick="endParking('${p.id}')">✅ End Parking</button>
       </div>
     </div>`;
-    }).join('');
+        }).join('');
+    } catch (e) {
+        c.innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted)">Error loading sessions</div>';
+    }
 }
 
-function endParking(id) {
-    const idx = savedParkings.findIndex(p => p.id === id);
-    if (idx === -1) return;
-    const p = savedParkings[idx];
-
-    // Final auto-fine calculation on end
-    if (p.userTier !== 'family') {
-        const hrs = (Date.now() - p.time) / 3600000;
-        const freeH = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
-        if (hrs > freeH) {
-            const otHrs = Math.max(0, hrs - freeH);
-            const finePH = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
-            const autoFineAmt = Math.ceil(otHrs) * finePH;
-            if (autoFineAmt > (p.fine || 0)) {
-                savedParkings[idx].fine = autoFineAmt;
-                savedParkings[idx].fineReason = `Overtime parking (${otHrs.toFixed(1)}h)`;
-                savedParkings[idx].fineTime = Date.now();
-            }
-        }
+async function endParking(id) {
+    try {
+        await api('PUT', `/parkings/${id}/end`);
+        showToast('Parking session ended ✅', 'success');
+        await loadActiveParkings();
+        loadDashboard();
+    } catch (e) {
+        showToast(e.message, 'error');
     }
-
-    savedParkings[idx].endTime = Date.now();
-    localStorage.setItem('sp_parkings', JSON.stringify(savedParkings));
-    showToast('Parking session ended', 'success');
-    loadActiveParkings(); loadDashboard();
 }
 
 /* ═══════════════════════════════════════
@@ -802,11 +819,11 @@ function openPayFineModal(id) {
     const p = savedParkings.find(pp => pp.id === id);
     if (!p) return;
 
-    const hrs = (Date.now() - p.time) / 3600000;
-    const freeH = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
-    const otHrs = Math.max(0, hrs - freeH);
-    const finePH = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
-    const autoFine = hrs > freeH ? Math.ceil(otHrs) * finePH : 0;
+    const hrs     = (Date.now() - p.time) / 3600000;
+    const freeH   = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
+    const otHrs   = Math.max(0, hrs - freeH);
+    const finePH  = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
+    const autoFine= hrs > freeH ? Math.ceil(otHrs) * finePH : 0;
     const totalFine = (p.fine || 0) + autoFine;
 
     document.getElementById('payFineInfo').innerHTML = `
@@ -821,7 +838,6 @@ function openPayFineModal(id) {
     ${autoFine > 0 ? `<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05)"><span style="color:var(--muted);font-size:11px">Overtime (${otHrs.toFixed(1)}h × ₹${finePH})</span> <strong style="float:right;color:var(--red)">₹${autoFine}</strong></div>` : ''}
     <div style="padding:6px 0;margin-top:4px;font-size:12px;color:var(--muted)">Payment will clear all outstanding charges for this session.</div>
   `;
-
     setPayMethod('upi');
     openModal('payFineModal');
 }
@@ -834,43 +850,34 @@ function setPayMethod(m) {
     });
 }
 
-function confirmPayFine() {
-    const idx = savedParkings.findIndex(p => p.id === activePayFineId);
-    if (idx === -1) return;
-
-    const p = savedParkings[idx];
-    const hrs = (Date.now() - p.time) / 3600000;
-    const freeH = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
-    const otHrs = Math.max(0, hrs - freeH);
-    const finePH = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
-    const autoFine = hrs > freeH ? Math.ceil(otHrs) * finePH : 0;
-    const totalFine = (p.fine || 0) + autoFine;
-
-    savedParkings[idx].finePaid = true;
-    savedParkings[idx].finePaidAmt = totalFine;
-    savedParkings[idx].finePaidMethod = selectedPayMethod;
-    savedParkings[idx].finePaidTime = Date.now();
-    if (autoFine > (p.fine || 0)) {
-        savedParkings[idx].fine = autoFine;
-        savedParkings[idx].fineReason = `Overtime (${otHrs.toFixed(1)}h)`;
+async function confirmPayFine() {
+    try {
+        const result = await api('POST', `/parkings/${activePayFineId}/pay-fine`, { method: selectedPayMethod });
+        closeModal('payFineModal');
+        showToast(`✅ ${result.message}`, 'success');
+        await loadActiveParkings();
+        loadDashboard();
+    } catch (e) {
+        showToast(e.message, 'error');
     }
-    localStorage.setItem('sp_parkings', JSON.stringify(savedParkings));
-
-    closeModal('payFineModal');
-    showToast(`✅ Payment of ₹${totalFine.toLocaleString()} via ${selectedPayMethod.toUpperCase()} confirmed!`, 'success');
-    loadActiveParkings(); loadDashboard();
 }
 
 /* ═══════════════════════════════════════
-   HISTORY (with Re-Park button)
+   HISTORY
 ═══════════════════════════════════════ */
-function loadHistory() {
-    const done = savedParkings.filter(p => p.endTime && p.email === currentUser.email).reverse();
+async function loadHistory() {
     const c = document.getElementById('historyList');
-    if (!done.length) { c.innerHTML = '<div style="text-align:center;padding:50px;color:var(--muted)">No parking history yet</div>'; return; }
-    c.innerHTML = done.map(p => {
-        const hrs = ((p.endTime - p.time) / 3600000).toFixed(1);
-        return `
+    try {
+        const done = await api('GET', '/parkings/history');
+        // Update cache
+        savedParkings = [...savedParkings.filter(p => !p.endTime), ...done];
+
+        if (!done.length) {
+            c.innerHTML = '<div style="text-align:center;padding:50px;color:var(--muted)">No parking history yet</div>'; return;
+        }
+        c.innerHTML = done.map(p => {
+            const hrs = ((p.endTime - p.time) / 3600000).toFixed(1);
+            return `
     <div class="parking-item">
       <div class="parking-header">
         <div><div class="parking-id">${p.id}</div><div style="font-size:12px;color:var(--muted);margin-top:3px">${new Date(p.time).toLocaleDateString()}</div></div>
@@ -884,15 +891,18 @@ function loadHistory() {
         ${p.fine > 0 ? `<div style="color:${p.finePaid ? 'var(--green)' : 'var(--red)'}"><strong>Fine</strong> &nbsp;₹${p.fine} — ${p.fineReason} ${p.finePaid ? '✅ PAID' : '⚠️ UNPAID'}</div>` : ''}
       </div>
       <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
-        <button class="btn btn-ghost btn-sm" onclick='showTicketModal(${JSON.stringify(p).replace(/'/g, "\\'")} )'>🎫 Ticket</button>
+        <button class="btn btn-ghost btn-sm" onclick='showTicketModal(${JSON.stringify(p).replace(/'/g,"\\'")} )'>🎫 Ticket</button>
         <button class="btn btn-primary btn-sm" onclick="openReParkModal('${p.id}')">🔄 Re-Park</button>
       </div>
     </div>`;
-    }).join('');
+        }).join('');
+    } catch (e) {
+        c.innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted)">Error loading history</div>';
+    }
 }
 
 /* ═══════════════════════════════════════
-   RE-PARK
+   RE-PARK  (unchanged — uses cache)
 ═══════════════════════════════════════ */
 function openReParkModal(id) {
     const p = savedParkings.find(pp => pp.id === id);
@@ -914,9 +924,7 @@ function confirmRePark() {
     closeModal('reParkModal');
     showSection('parking', document.querySelector('[data-sec="parking"]'));
 
-    // Pre-fill after a short delay for DOM render
     setTimeout(() => {
-        // Set state
         const stSel = document.getElementById('state');
         stSel.value = p.state || 'Maharashtra';
         updateCities();
@@ -931,12 +939,11 @@ function confirmRePark() {
                 facSel.disabled = false;
                 updateAreas();
                 setTimeout(() => {
-                    const areaSel = document.getElementById('area');
-                    areaSel.value = p.area;
+                    document.getElementById('area').value = p.area;
                     updateSlots();
-                    // Pre-select vehicle
-                    const vIdx = (currentUser.vehicles || []).findIndex(v => v.number === p.vehicle.number);
-                    if (vIdx >= 0) document.getElementById('selectedVehicle').value = vIdx;
+                    // Pre-select matching vehicle by number
+                    const match = currentUser.vehicles.find(v => v.number === p.vehicle.number);
+                    if (match) document.getElementById('selectedVehicle').value = match.id;
                 }, 100);
             }, 100);
         }, 100);
@@ -949,50 +956,57 @@ function confirmRePark() {
 /* ═══════════════════════════════════════
    PREMIUM
 ═══════════════════════════════════════ */
-function loadPremium() {
-    const tier = currentUser.tier;
-    const isPremium = tier === 'premium';
-    const isFamily = tier === 'family';
+async function loadPremium() {
+    try {
+        const status = await api('GET', '/premium/status');
+        currentUser.tier   = status.tier;
+        currentUser.family = status.family_members || [];
 
-    document.getElementById('planFree').style.borderColor = (!isPremium && !isFamily) ? 'rgba(0,212,255,0.5)' : 'var(--border)';
-    document.getElementById('planPremium').style.borderColor = isPremium ? 'rgba(168,85,247,0.9)' : 'rgba(168,85,247,0.5)';
-    document.getElementById('planFamily').style.borderColor = isFamily ? 'rgba(255,215,0,0.9)' : 'rgba(255,215,0,0.5)';
+        const isPremium = status.tier === 'premium';
+        const isFamily  = status.tier === 'family';
 
-    const fp = document.getElementById('familyPackContent');
-    if (!isFamily) {
-        fp.innerHTML = `<div style="text-align:center;padding:40px 20px;color:var(--muted)">
+        document.getElementById('planFree').style.borderColor    = (!isPremium && !isFamily) ? 'rgba(0,212,255,0.5)' : 'var(--border)';
+        document.getElementById('planPremium').style.borderColor = isPremium ? 'rgba(168,85,247,0.9)' : 'rgba(168,85,247,0.5)';
+        document.getElementById('planFamily').style.borderColor  = isFamily  ? 'rgba(255,215,0,0.9)' : 'rgba(255,215,0,0.5)';
+
+        const fp = document.getElementById('familyPackContent');
+        if (!isFamily) {
+            fp.innerHTML = `<div style="text-align:center;padding:40px 20px;color:var(--muted)">
       <div style="font-size:48px;margin-bottom:12px">🔒</div>
       <p style="margin-bottom:6px">Family Pack unlocks <strong style="color:var(--gold)">unlimited parking</strong> for 3 members</p>
       <p style="font-size:12px;margin-bottom:16px">₹999 / 2 months — Zero overtime fines, infinite hours</p>
       <button class="btn btn-warning" style="margin-top:8px" onclick="selectPlan('family')">👨‍👩‍👧 Upgrade to Family Pack</button>
     </div>`;
-        return;
-    }
-    const family = currentUser.family || [];
-    fp.innerHTML = `
+        } else {
+            const family = currentUser.family;
+            fp.innerHTML = `
     <div style="background:rgba(255,215,0,0.06);border:1px solid rgba(255,215,0,0.2);border-radius:10px;padding:14px;margin-bottom:16px;display:flex;align-items:center;gap:12px">
       <div style="font-size:24px">♾️</div>
       <div><div style="font-weight:700;color:var(--gold)">Unlimited Parking Active</div><div style="font-size:12px;color:var(--muted);margin-top:2px">No overtime fines ever for you and your family</div></div>
     </div>
     <div style="margin-bottom:14px;font-size:13px;color:var(--muted)">${family.length}/3 family members added</div>
-    ${family.map((m, i) => `
+    ${family.map(m => `
       <div class="family-member">
         <div style="display:flex;align-items:center;gap:12px">
           <div class="family-avatar">${m.name.charAt(0).toUpperCase()}</div>
           <div><div style="font-weight:600;font-size:14px">${m.name}</div><div style="font-size:12px;color:var(--muted)">${m.email}</div><div style="font-size:11px;color:var(--gold);margin-top:2px">♾️ Unlimited parking</div></div>
         </div>
-        <button class="btn btn-danger btn-sm" onclick="removeFamilyMember(${i})">Remove</button>
+        <button class="btn btn-danger btn-sm" onclick="removeFamilyMember(${m.id})">Remove</button>
       </div>`).join('')}
     ${family.length < 3 ? `<button class="btn btn-warning btn-sm" style="margin-top:10px" onclick="openModal('familyModal')">+ Add Family Member</button>` : `<div style="font-size:12px;color:var(--muted);margin-top:10px">✅ All 3 member slots filled</div>`}
   `;
+        }
+    } catch (e) {
+        console.error('loadPremium error:', e);
+    }
 }
 
 function setPurchaseTarget(t) {
     purchaseType = t;
-    document.getElementById('premiumOption').style.borderColor = t === 'premium' ? 'rgba(168,85,247,0.9)' : 'rgba(168,85,247,0.4)';
-    document.getElementById('familyOption').style.borderColor = t === 'family' ? 'rgba(255,215,0,0.9)' : 'rgba(255,215,0,0.4)';
-    document.getElementById('premiumSelectDot').style.display = t === 'premium' ? 'block' : 'none';
-    document.getElementById('familySelectDot').style.display = t === 'family' ? 'block' : 'none';
+    document.getElementById('premiumOption').style.borderColor   = t === 'premium' ? 'rgba(168,85,247,0.9)' : 'rgba(168,85,247,0.4)';
+    document.getElementById('familyOption').style.borderColor    = t === 'family'  ? 'rgba(255,215,0,0.9)'  : 'rgba(255,215,0,0.4)';
+    document.getElementById('premiumSelectDot').style.display    = t === 'premium' ? 'block' : 'none';
+    document.getElementById('familySelectDot').style.display     = t === 'family'  ? 'block' : 'none';
 }
 
 function selectPlan(plan) {
@@ -1002,182 +1016,92 @@ function selectPlan(plan) {
     openModal('premiumModal');
 }
 
-function activatePlan() {
-    const expiry = Date.now() + (60 * 24 * 60 * 60 * 1000); // 60 days
-    if (purchaseType === 'family') {
-        updateUserInStorage({ tier: 'family', premiumExpiry: expiry, family: currentUser.family || [] });
+async function activatePlan() {
+    try {
+        const res = await api('POST', '/premium/activate', { plan: purchaseType });
+        currentUser.tier           = res.tier;
+        currentUser.premium_expiry = res.expires_at;
+
         closeModal('premiumModal');
-        document.getElementById('userAvatar').classList.add('premium');
-        document.getElementById('tierBadge').textContent = 'Family';
-        document.getElementById('tierBadge').className = 'tier-badge tier-gold';
-        showToast('👨‍👩‍👧 Family Pack activated! ₹999 for 2 months. Unlimited parking!', 'success');
-    } else {
-        updateUserInStorage({ tier: 'premium', premiumExpiry: expiry });
-        closeModal('premiumModal');
-        document.getElementById('userAvatar').classList.add('premium');
-        document.getElementById('tierBadge').textContent = 'Premium';
-        document.getElementById('tierBadge').className = 'tier-badge tier-premium';
-        showToast('⭐ Premium activated! 20h free parking for 2 months!', 'success');
+        const av = document.getElementById('userAvatar');
+        const tb = document.getElementById('tierBadge');
+        av.classList.add('premium');
+
+        if (purchaseType === 'family') {
+            tb.textContent = 'Family'; tb.className = 'tier-badge tier-gold';
+            showToast('👨‍👩‍👧 Family Pack activated! ₹999 for 2 months. Unlimited parking!', 'success');
+        } else {
+            tb.textContent = 'Premium'; tb.className = 'tier-badge tier-premium';
+            showToast('⭐ Premium activated! 20h free parking for 2 months!', 'success');
+        }
+        await loadPremium();
+        loadDashboard();
+    } catch (e) {
+        showToast(e.message, 'error');
     }
-    loadPremium(); loadDashboard();
 }
 
-function addFamilyMember() {
+async function addFamilyMember() {
     if (currentUser.tier !== 'family') { showToast('Family Pack required', 'error'); return; }
-    const name = document.getElementById('fmName').value.trim();
+    const name  = document.getElementById('fmName').value.trim();
     const email = document.getElementById('fmEmail').value.trim().toLowerCase();
     if (!name || !email) { showToast('Enter name and email', 'error'); return; }
-    if (!currentUser.family) currentUser.family = [];
-    if (currentUser.family.length >= 3) { showToast('Max 3 members', 'warning'); return; }
-    if (currentUser.family.some(m => m.email === email)) { showToast('Already added', 'error'); return; }
-    currentUser.family.push({ name, email });
-    updateUserInStorage({ family: currentUser.family });
-    closeModal('familyModal');
-    document.getElementById('fmName').value = '';
-    document.getElementById('fmEmail').value = '';
-    showToast(`✅ ${name} added!`, 'success');
-    loadPremium();
+
+    try {
+        await api('POST', '/premium/family', { name, email });
+        closeModal('familyModal');
+        document.getElementById('fmName').value  = '';
+        document.getElementById('fmEmail').value = '';
+        showToast(`✅ ${name} added!`, 'success');
+        await loadPremium();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
 }
 
-function removeFamilyMember(i) {
-    currentUser.family.splice(i, 1);
-    updateUserInStorage({ family: currentUser.family });
-    showToast('Member removed', 'success');
-    loadPremium();
-}
-
-/* ═══════════════════════════════════════
-   AUTO-FINE TIMER
-   Every 30 min: apply fine for overtime users
-═══════════════════════════════════════ */
-function runAutoFines() {
-    let changed = false;
-    savedParkings.forEach((p, idx) => {
-        if (p.endTime || p.userTier === 'family') return;
-        const hrs = (Date.now() - p.time) / 3600000;
-        const freeH = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
-        if (hrs <= freeH) return;
-
-        const otHrs = Math.max(0, hrs - freeH);
-        const finePH = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
-        const calcFine = Math.ceil(otHrs) * finePH;
-
-        if (calcFine > (savedParkings[idx].autoFineApplied || 0)) {
-            savedParkings[idx].fine = calcFine;
-            savedParkings[idx].fineReason = `Overtime parking (${otHrs.toFixed(1)}h)`;
-            savedParkings[idx].fineTime = Date.now();
-            savedParkings[idx].autoFineApplied = calcFine;
-            savedParkings[idx].finePaid = false;
-            changed = true;
-
-            // Notify current user
-            if (!isAdmin && p.email === currentUser?.email) {
-                showToast(`💸 Auto-fine ₹${calcFine.toLocaleString()} applied to ${p.vehicle.number} (${otHrs.toFixed(1)}h overtime)`, 'error');
-            }
-        }
-    });
-    if (changed) localStorage.setItem('sp_parkings', JSON.stringify(savedParkings));
-}
-
-function startAutoFineTimer() {
-    runAutoFines();
-    setInterval(runAutoFines, AUTO_FINE_INTERVAL_HRS * 60 * 60 * 1000);
+async function removeFamilyMember(memberId) {
+    try {
+        await api('DELETE', `/premium/family/${memberId}`);
+        showToast('Member removed', 'success');
+        await loadPremium();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
 }
 
 /* ═══════════════════════════════════════
-   OVERTIME NOTIFICATIONS
-   - 10h warn for free users (2h left before 12h)
-   - 18h warn for premium users (2h left before 20h)
-   - On overtime start: toast
+   OVERTIME NOTIFICATIONS  (client-side)
 ═══════════════════════════════════════ */
 function checkOvertimeNotifications() {
     const active = savedParkings.filter(p => !p.endTime);
-    let changed = false;
 
-    active.forEach((p, _) => {
+    active.forEach(p => {
         if (p.userTier === 'family') return;
-        const hrs = (Date.now() - p.time) / 3600000;
+        const hrs   = (Date.now() - p.time) / 3600000;
         const freeH = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
         const warnH = freeH - WARN_BEFORE;
-        const idx = savedParkings.findIndex(pp => pp.id === p.id);
 
-        // 2h-before warning
-        if (hrs >= warnH && !p.notified10h) {
-            savedParkings[idx].notified10h = true;
-            changed = true;
+        if (hrs >= warnH && !p._warnShown) {
+            p._warnShown = true;
             if (!isAdmin && p.email === currentUser?.email) {
                 showToast(`⚠️ ${p.vehicle.number}: Only ${WARN_BEFORE}h remaining before overtime fines of ₹${p.userTier === 'premium' ? FINE_PAID : FINE_FREE}/hr apply!`, 'warning');
             }
-            if (isAdmin) {
-                showToast(`⚠️ ${p.id} (${p.userTier}): ${WARN_BEFORE}h to overtime`, 'warning');
-            }
         }
-
-        // Overtime start
-        if (hrs >= freeH && !p.notifiedOvertime) {
-            savedParkings[idx].notifiedOvertime = true;
-            changed = true;
+        if (hrs >= freeH && !p._overtimeShown) {
+            p._overtimeShown = true;
             if (!isAdmin && p.email === currentUser?.email) {
-                const finePH = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
-                showToast(`🚨 ${p.vehicle.number} is now in OVERTIME! ₹${finePH}/hr fine is being charged.`, 'error');
-            }
-            if (isAdmin) {
-                showToast(`🚨 OVERTIME: ${p.id} — ${p.vehicle.number} (${p.userTier})`, 'error');
+                showToast(`🚨 ${p.vehicle.number} is now in OVERTIME! ₹${p.userTier === 'premium' ? FINE_PAID : FINE_FREE}/hr fine is being charged.`, 'error');
             }
         }
     });
-
-    if (changed) localStorage.setItem('sp_parkings', JSON.stringify(savedParkings));
 
     const badge = document.getElementById('adminBadge');
     if (badge) {
         const oc = getOvertimeParkings().length;
-        badge.textContent = oc;
-        badge.style.display = oc ? 'inline' : 'none';
+        badge.textContent    = oc;
+        badge.style.display  = oc ? 'inline' : 'none';
     }
 }
-
-/* ═══════════════════════════════════════
-   ADMIN PANEL
-═══════════════════════════════════════ */
-function loadAdmin() {
-    const all = savedParkings;
-    const active = all.filter(p => !p.endTime);
-    const fines = all.filter(p => p.fine > 0);
-    const overtime = getOvertimeParkings();
-    const totalFines = all.reduce((s, p) => s + (p.fine || 0), 0);
-
-    document.getElementById('adminStatsGrid').innerHTML = `
-    <div class="stat-card cyan"><div class="stat-icon">📊</div><div class="stat-value cyan">${all.length}</div><div class="stat-label">Total Parkings</div></div>
-    <div class="stat-card green"><div class="stat-icon">🟢</div><div class="stat-value green">${active.length}</div><div class="stat-label">Active Now</div></div>
-    <div class="stat-card orange"><div class="stat-icon">⚠️</div><div class="stat-value orange">${overtime.length}</div><div class="stat-label">Overtime</div></div>
-    <div class="stat-card gold"><div class="stat-icon">💰</div><div class="stat-value gold">₹${totalFines.toLocaleString()}</div><div class="stat-label">Total Fines</div></div>
-  `;
-
-    renderOvertimeAlerts(overtime);
-    renderAdminParkings();
-    renderFineLog(fines);
-}
-
-// Add this to app.js to sync the Admin Panel on the spot
-window.addEventListener('storage', (event) => {
-    if (event.key === 'sp_parkings') {
-        // Reload the data from LocalStorage
-        savedParkings = JSON.parse(localStorage.getItem('sp_parkings')) || [];
-
-        // Check which section the admin is currently viewing and update it instantly
-        const activeSec = document.querySelector('.menu-item.active')?.dataset?.sec;
-        if (activeSec === 'admin') {
-            loadAdmin();
-        } else if (activeSec === 'slotmap') {
-            renderAdminSlotMap();
-            renderSlotMapStats();
-        }
-
-        // Update any overtime notifications immediately
-        checkOvertimeNotifications();
-    }
-});
 
 function getOvertimeParkings() {
     return savedParkings.filter(p => {
@@ -1187,20 +1111,50 @@ function getOvertimeParkings() {
     });
 }
 
+/* ═══════════════════════════════════════
+   ADMIN PANEL
+═══════════════════════════════════════ */
+async function loadAdmin() {
+    try {
+        const [stats, active, fines] = await Promise.all([
+            api('GET', '/admin/stats'),
+            api('GET', '/admin/parkings'),
+            api('GET', '/admin/fines')
+        ]);
+        // Populate cache so slot map and notifications work
+        savedParkings = active;
+
+        document.getElementById('adminStatsGrid').innerHTML = `
+    <div class="stat-card cyan"><div class="stat-icon">📊</div><div class="stat-value cyan">${stats.total_parkings}</div><div class="stat-label">Total Parkings</div></div>
+    <div class="stat-card green"><div class="stat-icon">🟢</div><div class="stat-value green">${stats.active_parkings}</div><div class="stat-label">Active Now</div></div>
+    <div class="stat-card orange"><div class="stat-icon">⚠️</div><div class="stat-value orange">${stats.overtime_count}</div><div class="stat-label">Overtime</div></div>
+    <div class="stat-card gold"><div class="stat-icon">💰</div><div class="stat-value gold">₹${stats.total_fines.toLocaleString()}</div><div class="stat-label">Total Fines</div></div>
+  `;
+
+        const overtime = getOvertimeParkings();
+        renderOvertimeAlerts(overtime);
+        renderAdminParkings(active);
+        renderFineLog(fines);
+        checkOvertimeNotifications();
+    } catch (e) {
+        console.error('loadAdmin error:', e);
+    }
+}
+
 function renderOvertimeAlerts(overtime) {
-    const c = document.getElementById('overtimeAlertsList');
-    const nd = document.getElementById('notifDot');
+    const c     = document.getElementById('overtimeAlertsList');
+    const nd    = document.getElementById('notifDot');
     const badge = document.getElementById('adminBadge');
     if (badge) badge.textContent = overtime.length;
-    if (nd) nd.style.display = overtime.length ? 'block' : 'none';
+    if (nd)    nd.style.display  = overtime.length ? 'block' : 'none';
 
     if (!overtime.length) { c.innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted)">✅ No overtime alerts</div>'; return; }
 
     c.innerHTML = overtime.map(p => {
-        const hrs = ((Date.now() - p.time) / 3600000).toFixed(1);
-        const freeH = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
-        const otHrs = Math.max(0, parseFloat(hrs) - freeH).toFixed(1);
-        const finePH = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
+        const hrs         = ((Date.now() - p.time) / 3600000).toFixed(1);
+        const freeH       = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
+        const otHrs       = Math.max(0, parseFloat(hrs) - freeH).toFixed(1);
+        const finePH      = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
         const suggestedFine = Math.ceil(parseFloat(otHrs)) * finePH;
         return `
     <div class="overtime-alert">
@@ -1220,18 +1174,20 @@ function renderOvertimeAlerts(overtime) {
     }).join('');
 }
 
-function renderAdminParkings() {
+function renderAdminParkings(active) {
     const q = (document.getElementById('adminSearch')?.value || '').toLowerCase();
-    const active = savedParkings.filter(p => !p.endTime && (!q || p.id.toLowerCase().includes(q) || p.vehicle.number.toLowerCase().includes(q)));
+    const rows = (active || savedParkings.filter(p => !p.endTime)).filter(p =>
+        !q || p.id.toLowerCase().includes(q) || p.vehicle.number.toLowerCase().includes(q)
+    );
     const c = document.getElementById('adminParkingsList');
-    if (!active.length) { c.innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted)">No active parkings</div>'; return; }
+    if (!rows.length) { c.innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted)">No active parkings</div>'; return; }
 
-    c.innerHTML = active.map(p => {
-        const hrs = ((Date.now() - p.time) / 3600000).toFixed(1);
-        const freeH = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
-        const isOver = p.userTier !== 'family' && parseFloat(hrs) > freeH;
-        const otHrs = isOver ? Math.max(0, parseFloat(hrs) - freeH) : 0;
-        const finePH = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
+    c.innerHTML = rows.map(p => {
+        const hrs         = ((Date.now() - p.time) / 3600000).toFixed(1);
+        const freeH       = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
+        const isOver      = p.userTier !== 'family' && parseFloat(hrs) > freeH;
+        const otHrs       = isOver ? Math.max(0, parseFloat(hrs) - freeH) : 0;
+        const finePH      = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
         const suggestedFine = isOver ? Math.ceil(otHrs) * finePH : 500;
         return `
     <div class="fine-row" style="${isOver ? 'border-color:rgba(255,23,68,0.3);' : ''}">
@@ -1253,7 +1209,7 @@ function renderAdminParkings() {
 function renderFineLog(fines) {
     const c = document.getElementById('fineLog');
     if (!fines.length) { c.innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted)">No fines applied yet</div>'; return; }
-    c.innerHTML = [...fines].reverse().map(p => `
+    c.innerHTML = fines.map(p => `
     <div class="fine-row">
       <div>
         <div style="font-family:'Space Mono',monospace;font-size:13px;color:var(--p)">${p.id}</div>
@@ -1281,37 +1237,37 @@ function openFineModal(id, suggested) {
     <div><strong>Duration:</strong> ${hrs}h</div>
     ${p.fine > 0 ? `<div style="color:var(--red)"><strong>Existing Fine:</strong> ₹${p.fine} (${p.finePaid ? 'PAID' : 'UNPAID'})</div>` : ''}
   `;
-    document.getElementById('fineAmount').value = suggested || 500;
-    document.getElementById('fineReason').value = 'Overtime parking';
-    document.getElementById('fineNotes').value = '';
+    document.getElementById('fineAmount').value  = suggested || 500;
+    document.getElementById('fineReason').value  = 'Overtime parking';
+    document.getElementById('fineNotes').value   = '';
     openModal('applyFineModal');
 }
 
-function confirmFine() {
+async function confirmFine() {
     const amount = parseInt(document.getElementById('fineAmount').value) || 0;
     const reason = document.getElementById('fineReason').value;
-    const notes = document.getElementById('fineNotes').value.trim();
+    const notes  = document.getElementById('fineNotes').value.trim();
     if (!amount || amount <= 0) { showToast('Enter a valid fine amount', 'error'); return; }
-    const idx = savedParkings.findIndex(p => p.id === activeFineId);
-    if (idx === -1) return;
 
-    savedParkings[idx].fine = amount;
-    savedParkings[idx].fineReason = reason + (notes ? ` — ${notes}` : '');
-    savedParkings[idx].fineTime = Date.now();
-    savedParkings[idx].finePaid = false;
-    localStorage.setItem('sp_parkings', JSON.stringify(savedParkings));
-    closeModal('applyFineModal');
-    showToast(`💸 Fine of ₹${amount.toLocaleString()} applied to ${activeFineId}. Reason: ${reason}`, 'success');
-    loadAdmin();
+    try {
+        await api('POST', `/admin/fines/${activeFineId}`, { amount, reason, notes });
+        showToast(`💸 Fine of ₹${amount.toLocaleString()} applied to ${activeFineId}. Reason: ${reason}`, 'success');
+        closeModal('applyFineModal');
+        await loadAdmin();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
 }
 
-function adminEndParking(id) {
+async function adminEndParking(id) {
     if (!confirm('End this parking session?')) return;
-    const idx = savedParkings.findIndex(p => p.id === id);
-    if (idx !== -1) { savedParkings[idx].endTime = Date.now(); localStorage.setItem('sp_parkings', JSON.stringify(savedParkings)); }
-    showToast('Parking ended by admin', 'success');
-    loadAdmin();
-    closeModal('applyFineModal');
+    try {
+        await api('PUT', `/admin/parkings/${id}/end`);
+        showToast('Parking ended by admin', 'success');
+        await loadAdmin();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
 }
 
 /* ═══════════════════════════════════════
@@ -1330,7 +1286,7 @@ function adminUpdateFacilities() {
 }
 
 function adminUpdateAreas() {
-    const fac = document.getElementById('adminFacility').value;
+    const fac  = document.getElementById('adminFacility').value;
     const aSel = document.getElementById('adminArea');
     aSel.innerHTML = '<option value="">Select Area</option>';
     if (!fac) return;
@@ -1343,7 +1299,7 @@ function adminUpdateAreas() {
 
 function renderSlotMapStats() {
     const allActive = savedParkings.filter(p => !p.endTime);
-    const overtime = getOvertimeParkings();
+    const overtime  = getOvertimeParkings();
     document.getElementById('slotMapStats').innerHTML = `
     <div class="stat-card green"><div class="stat-icon">🟢</div><div class="stat-value green">${allActive.length}</div><div class="stat-label">Currently Parked</div></div>
     <div class="stat-card orange"><div class="stat-icon">⚠️</div><div class="stat-value orange">${overtime.length}</div><div class="stat-label">Overtime Now</div></div>
@@ -1352,50 +1308,59 @@ function renderSlotMapStats() {
   `;
 }
 
-function renderAdminSlotMap() {
-    const fac = document.getElementById('adminFacility').value;
+async function renderAdminSlotMap() {
+    const fac  = document.getElementById('adminFacility').value;
     const area = document.getElementById('adminArea').value;
     if (!fac || !area) {
         document.getElementById('adminSlotMapGrid').innerHTML = '<div style="text-align:center;padding:40px;color:var(--muted);grid-column:1/-1">Select a facility and area to view</div>';
         return;
     }
-    const areaActive = savedParkings.filter(p => !p.endTime && p.facility === fac && p.area === area);
-    const occupiedMap = {};
-    areaActive.forEach(p => { occupiedMap[p.slot] = p; });
-    const TOTAL_SLOTS = 50;
-    const available = TOTAL_SLOTS - areaActive.length;
-    document.getElementById('slotMapTitle').innerHTML = `${fac} — Area ${area} &nbsp;<span style="font-size:13px;color:var(--green);font-family:'Space Mono',monospace">${available} free</span> / <span style="font-size:13px;color:var(--red);font-family:'Space Mono',monospace">${areaActive.length} occupied</span>`;
 
-    const grid = document.getElementById('adminSlotMapGrid');
-    let html = '';
-    for (let i = 1; i <= TOTAL_SLOTS; i++) {
-        const p = occupiedMap[i];
-        const isOver = p && p.userTier !== 'family' && ((Date.now() - p.time) / 3600000 > (p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS));
-        const bg = p ? (isOver ? 'rgba(255,171,0,0.25)' : 'rgba(255,23,68,0.2)') : 'rgba(0,230,118,0.15)';
-        const border = p ? (isOver ? 'rgba(255,171,0,0.6)' : 'rgba(255,23,68,0.5)') : 'rgba(0,230,118,0.5)';
-        const color = p ? (isOver ? 'var(--warning)' : 'var(--red)') : 'var(--green)';
-        const familyBadge = p && p.userTier === 'family' ? '<div style="position:absolute;top:1px;left:1px;font-size:6px">♾️</div>' : '';
-        html += `<div onclick="${p ? `showSlotDetail(${i},'${fac}','${area}')` : ''}" title="${p ? p.vehicle.name + ' — ' + p.userName : 'Available'}" style="aspect-ratio:1;background:${bg};border:1.5px solid ${border};border-radius:7px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:${color};cursor:${p ? 'pointer' : 'default'};transition:all 0.2s;position:relative;font-family:'Space Mono',monospace;${p ? 'box-shadow:0 0 8px ' + border + ';' : ''}" onmouseover="this.style.transform='scale(1.12)'" onmouseout="this.style.transform='scale(1)'">
+    try {
+        const data = await api('GET', `/admin/slots/${encodeURIComponent(fac)}/${encodeURIComponent(area)}`);
+        const areaActive  = data.parkings || [];
+        const occupiedMap = {};
+        areaActive.forEach(p => { occupiedMap[p.slot] = p; });
+
+        const available = 50 - areaActive.length;
+        document.getElementById('slotMapTitle').innerHTML = `${fac} — Area ${area} &nbsp;<span style="font-size:13px;color:var(--green);font-family:'Space Mono',monospace">${available} free</span> / <span style="font-size:13px;color:var(--red);font-family:'Space Mono',monospace">${areaActive.length} occupied</span>`;
+
+        const grid = document.getElementById('adminSlotMapGrid');
+        let html = '';
+        for (let i = 1; i <= 50; i++) {
+            const p      = occupiedMap[i];
+            const isOver = p && p.userTier !== 'family' && ((Date.now() - p.time) / 3600000 > (p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS));
+            const bg     = p ? (isOver ? 'rgba(255,171,0,0.25)' : 'rgba(255,23,68,0.2)') : 'rgba(0,230,118,0.15)';
+            const border = p ? (isOver ? 'rgba(255,171,0,0.6)' : 'rgba(255,23,68,0.5)') : 'rgba(0,230,118,0.5)';
+            const color  = p ? (isOver ? 'var(--warning)' : 'var(--red)') : 'var(--green)';
+            const familyBadge = p && p.userTier === 'family' ? '<div style="position:absolute;top:1px;left:1px;font-size:6px">♾️</div>' : '';
+            html += `<div onclick="${p ? `showSlotDetail(${i},'${fac}','${area}')` : ''}" title="${p ? p.vehicle.name + ' — ' + p.userName : 'Available'}" style="aspect-ratio:1;background:${bg};border:1.5px solid ${border};border-radius:7px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:${color};cursor:${p ? 'pointer' : 'default'};transition:all 0.2s;position:relative;font-family:'Space Mono',monospace;${p ? 'box-shadow:0 0 8px ' + border + ';' : ''}" onmouseover="this.style.transform='scale(1.12)'" onmouseout="this.style.transform='scale(1)'">
       ${familyBadge}
       <div>${i}</div>
       ${p ? `<div style="font-size:7px;color:${color};opacity:0.8;margin-top:2px">${p.vehicle.number.slice(-4)}</div>` : ''}
       ${isOver ? '<div style="position:absolute;top:2px;right:2px;font-size:8px">⚠️</div>' : ''}
     </div>`;
-    }
-    grid.innerHTML = html;
+        }
+        grid.innerHTML = html;
 
-    document.getElementById('adminAreaUsersCard').style.display = 'block';
-    document.getElementById('adminAreaUsersTitle').textContent = `Active Users — ${fac} / Area ${area}`;
-    const tbody = document.getElementById('adminAreaTableBody');
-    if (!areaActive.length) { tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--muted)">No users parked here</td></tr>`; return; }
-    tbody.innerHTML = areaActive.map(p => {
-        const hrs = ((Date.now() - p.time) / 3600000).toFixed(1);
-        const freeH = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
-        const isOver = p.userTier !== 'family' && parseFloat(hrs) > freeH;
-        const otHrs = isOver ? Math.max(0, parseFloat(hrs) - freeH).toFixed(1) : '0';
-        const finePH = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
-        const estFine = isOver ? Math.ceil(parseFloat(otHrs)) * finePH : 0;
-        return `<tr style="border-bottom:1px solid var(--border2)">
+        // Update cache with area parkings
+        const otherArea = savedParkings.filter(p => p.facility !== fac || p.area !== area);
+        savedParkings = [...otherArea, ...areaActive];
+
+        document.getElementById('adminAreaUsersCard').style.display = 'block';
+        document.getElementById('adminAreaUsersTitle').textContent = `Active Users — ${fac} / Area ${area}`;
+        const tbody = document.getElementById('adminAreaTableBody');
+        if (!areaActive.length) {
+            tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--muted)">No users parked here</td></tr>`; return;
+        }
+        tbody.innerHTML = areaActive.map(p => {
+            const hrs    = ((Date.now() - p.time) / 3600000).toFixed(1);
+            const freeH  = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
+            const isOver = p.userTier !== 'family' && parseFloat(hrs) > freeH;
+            const otHrs  = isOver ? Math.max(0, parseFloat(hrs) - freeH).toFixed(1) : '0';
+            const finePH = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
+            const estFine= isOver ? Math.ceil(parseFloat(otHrs)) * finePH : 0;
+            return `<tr style="border-bottom:1px solid var(--border2)">
       <td style="padding:10px 12px;font-family:'Space Mono',monospace;color:var(--p);font-weight:700">${area}-${p.slot}</td>
       <td style="padding:10px 12px"><div style="font-weight:600;font-size:13px">${p.userName}</div><div style="font-size:11px;color:var(--muted)">${p.email}</div></td>
       <td style="padding:10px 12px"><div style="font-weight:600;font-size:13px">${p.vehicle.name}</div><div style="font-family:'Space Mono',monospace;font-size:11px;color:var(--muted)">${p.vehicle.number}</div></td>
@@ -1405,18 +1370,21 @@ function renderAdminSlotMap() {
       <td style="padding:10px 12px"><div style="display:flex;gap:6px;flex-wrap:wrap">${p.userTier !== 'family' ? `<button class="btn btn-warning btn-sm" onclick="openFineModal('${p.id}',${estFine || 500})">💸</button>` : ''}
         <button class="btn btn-danger btn-sm" onclick="adminEndParking('${p.id}')">⏹</button></div></td>
     </tr>`;
-    }).join('');
+        }).join('');
+    } catch (e) {
+        console.error('renderAdminSlotMap error:', e);
+    }
 }
 
 function showSlotDetail(slot, fac, area) {
-    const p = savedParkings.find(pp => !pp.endTime && pp.facility === fac && pp.area === area && pp.slot === slot);
+    const p     = savedParkings.find(pp => !pp.endTime && pp.facility === fac && pp.area === area && pp.slot === slot);
     const panel = document.getElementById('slotUserPanel');
     if (!p) { panel.style.display = 'none'; return; }
-    const hrs = ((Date.now() - p.time) / 3600000).toFixed(1);
-    const freeH = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
-    const isOver = p.userTier !== 'family' && parseFloat(hrs) > freeH;
-    const otHrs = isOver ? Math.max(0, parseFloat(hrs) - freeH).toFixed(1) : '0';
-    const finePH = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
+    const hrs     = ((Date.now() - p.time) / 3600000).toFixed(1);
+    const freeH   = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
+    const isOver  = p.userTier !== 'family' && parseFloat(hrs) > freeH;
+    const otHrs   = isOver ? Math.max(0, parseFloat(hrs) - freeH).toFixed(1) : '0';
+    const finePH  = p.userTier === 'premium' ? FINE_PAID : FINE_FREE;
     const estFine = isOver ? Math.ceil(parseFloat(otHrs)) * finePH : 0;
     document.getElementById('slotUserInfo').innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:start;flex-wrap:wrap;gap:10px">
@@ -1443,45 +1411,128 @@ function showSlotDetail(slot, fac, area) {
 }
 
 function exportAreaCSV() {
-    const fac = document.getElementById('adminFacility').value;
+    const fac  = document.getElementById('adminFacility').value;
     const area = document.getElementById('adminArea').value;
     if (!fac || !area) { showToast('Select facility and area first', 'error'); return; }
     const active = savedParkings.filter(p => !p.endTime && p.facility === fac && p.area === area);
     if (!active.length) { showToast('No active parkings to export', 'warning'); return; }
     const rows = [['Slot', 'ID', 'User', 'Email', 'Vehicle', 'Plate', 'Duration(h)', 'Plan', 'Fine', 'Paid', 'Status']];
     active.forEach(p => {
-        const hrs = ((Date.now() - p.time) / 3600000).toFixed(1);
-        const freeH = p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
+        const hrs  = ((Date.now() - p.time) / 3600000).toFixed(1);
+        const freeH= p.userTier === 'premium' ? PAID_HOURS : FREE_HOURS;
         rows.push([`${area}-${p.slot}`, p.id, p.userName, p.email, p.vehicle.name, p.vehicle.number, hrs, p.userTier || 'free', p.fine || 0, p.finePaid ? 'Yes' : 'No', p.userTier !== 'family' && parseFloat(hrs) > freeH ? 'Overtime' : 'Active']);
     });
     const csv = rows.map(r => r.join(',')).join('\n');
-    const a = document.createElement('a');
-    a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+    const a   = document.createElement('a');
+    a.href     = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
     a.download = `${fac}_${area}_${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     showToast('CSV exported!', 'success');
 }
 
-let adminAutoRefreshInterval = null;
 function startAdminAutoRefresh() {
     if (adminAutoRefreshInterval) clearInterval(adminAutoRefreshInterval);
     adminAutoRefreshInterval = setInterval(() => {
         const sec = document.querySelector('.menu-item.active')?.dataset?.sec;
-        if (sec === 'admin') loadAdmin();
+        if (sec === 'admin')   loadAdmin();
         if (sec === 'slotmap') { renderAdminSlotMap(); renderSlotMapStats(); }
         checkOvertimeNotifications();
-        runAutoFines();
     }, 30000);
+}
+
+/* ═══════════════════════════════════════
+   WEBSOCKET — real-time updates
+═══════════════════════════════════════ */
+function connectWebSocket() {
+    if (wsConnection) return;
+    try {
+        const wsUrl = API.replace('http', 'ws') + '/ws/slots';
+        wsConnection = new WebSocket(wsUrl);
+
+        wsConnection.onopen = () => {
+            console.log('✅ WebSocket connected');
+            // Keepalive ping every 30 seconds
+            setInterval(() => {
+                if (wsConnection?.readyState === WebSocket.OPEN)
+                    wsConnection.send(JSON.stringify({ type: 'ping' }));
+            }, 30000);
+        };
+
+        wsConnection.onmessage = ({ data }) => {
+            try {
+                const msg = JSON.parse(data);
+                if (msg.type === 'pong') return;
+                handleWsEvent(msg);
+            } catch (e) { /* ignore */ }
+        };
+
+        wsConnection.onclose = () => {
+            console.warn('WS disconnected — reconnecting in 5s');
+            wsConnection = null;
+            setTimeout(connectWebSocket, 5000);
+        };
+
+        wsConnection.onerror = (e) => {
+            console.error('WS error:', e);
+        };
+    } catch (e) {
+        console.error('WebSocket init failed:', e);
+    }
+}
+
+function handleWsEvent(msg) {
+    const sec = document.querySelector('.menu-item.active')?.dataset?.sec;
+
+    switch (msg.event) {
+        case 'slot_occupied':
+            if (!isAdmin && sec === 'parking') updateSlots();
+            if (isAdmin) { if (sec === 'admin') loadAdmin(); if (sec === 'slotmap') { renderAdminSlotMap(); renderSlotMapStats(); } }
+            break;
+
+        case 'slot_freed':
+            if (!isAdmin && sec === 'parking') updateSlots();
+            if (!isAdmin && sec === 'active')  loadActiveParkings();
+            if (isAdmin) { if (sec === 'admin') loadAdmin(); if (sec === 'slotmap') { renderAdminSlotMap(); renderSlotMapStats(); } }
+            break;
+
+        case 'auto_fine':
+            showToast(`💸 Auto-fine ₹${msg.fineAmount?.toLocaleString()} applied to ${msg.vehicle} (${msg.otHours}h overtime)`, 'error');
+            if (sec === 'active') loadActiveParkings();
+            if (isAdmin && sec === 'admin') loadAdmin();
+            break;
+
+        case 'warn_notification':
+            if (!isAdmin) showToast(msg.message, 'warning');
+            if (isAdmin)  showToast(`⚠️ ${msg.parkingId} — ${WARN_BEFORE}h to overtime`, 'warning');
+            break;
+
+        case 'overtime_started':
+            if (!isAdmin) showToast(msg.message, 'error');
+            if (isAdmin)  showToast(`🚨 OVERTIME: ${msg.parkingId} — ${msg.vehicle}`, 'error');
+            if (isAdmin && sec === 'admin') loadAdmin();
+            break;
+
+        case 'fine_applied':
+            showToast(msg.message, 'warning');
+            if (sec === 'active') loadActiveParkings();
+            if (isAdmin && sec === 'admin') loadAdmin();
+            break;
+
+        case 'fine_paid':
+            if (isAdmin && sec === 'admin') loadAdmin();
+            break;
+    }
+    checkOvertimeNotifications();
 }
 
 /* ═══════════════════════════════════════
    MODALS & UTILS
 ═══════════════════════════════════════ */
-function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
+function openModal(id)  { document.getElementById(id).classList.remove('hidden'); }
 function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
 
 function showToast(msg, type = 'success') {
-    const t = document.createElement('div');
+    const t    = document.createElement('div');
     const icons = { success: '✅', error: '❌', warning: '⚠️', info: 'ℹ️' };
     t.className = `toast ${type}`;
     t.innerHTML = `<span style="font-size:16px">${icons[type] || 'ℹ️'}</span><span style="font-size:13px;font-weight:500">${msg}</span>`;
@@ -1491,111 +1542,39 @@ function showToast(msg, type = 'success') {
 
 function timeAgo(ts) {
     const s = Math.floor((Date.now() - ts) / 1000);
-    if (s < 60) return 'Just now';
-    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    if (s < 60)    return 'Just now';
+    if (s < 3600)  return `${Math.floor(s / 60)}m ago`;
     if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
     return `${Math.floor(s / 86400)}d ago`;
 }
 
 /* ═══════════════════════════════════════
-   WINDOW INIT
+   WINDOW INIT — restore session via API
 ═══════════════════════════════════════ */
-window.addEventListener('DOMContentLoaded', function () {
+window.addEventListener('DOMContentLoaded', async function () {
     const hint = document.getElementById('credHint');
     if (hint) {
         const u = 'prathamesh\u0040gmail.com';
-        const a = 'admin\u0040smartpark.com';
         hint.innerHTML =
             `<span onclick="fillLoginCredential('user')" style="cursor:pointer;display:block;padding:4px 0" onmouseover="this.style.color='#00d4ff'" onmouseout="this.style.color=''">👤 User: ${u} / 1304Pra <span style="font-size:10px;opacity:0.6">(click to fill)</span></span>`;
     }
 
-    seedUsers();
-
-    // Restore session
-    try {
-        const saved = localStorage.getItem('sp_currentUser');
-        if (saved) {
-            const u = JSON.parse(saved);
-            if (u && u.email && u.name) {
-                isAdmin = (u.email === ADMIN_EMAIL);
-                currentUser = u;
-                initApp();
-                return;
-            }
+    // Try to restore session from saved token
+    const savedToken = localStorage.getItem('sp_token');
+    if (savedToken) {
+        apiToken = savedToken;
+        try {
+            const me = await api('GET', '/auth/me');
+            currentUser = { ...me, vehicles: [], family: [] };
+            isAdmin     = me.tier === 'admin';
+            initApp();
+            return;
+        } catch (e) {
+            // Token expired / invalid — clear it
+            localStorage.removeItem('sp_token');
+            apiToken = null;
         }
-    } catch (e) {
-        console.warn('Session restore failed:', e);
-        localStorage.removeItem('sp_currentUser');
     }
+    // Show login page
+    document.getElementById('loginPage').style.display = 'flex';
 });
-
-/* ═══════════════════════════════════════
-   DEMO DATA SEEDER
-═══════════════════════════════════════ */
-function seedDemoParkings() {
-    if (savedParkings.length > 0) return; // Only seed if empty
-
-    const now = Date.now();
-    const oneHour = 3600000;
-
-    const demoData = [
-        {
-            id: "PKG000001",
-            email: "prathamesh@gmail.com",
-            userName: "Prathamesh",
-            vehicle: { name: "Tesla Model 3", number: "MH-12-PA-1234", type: "car" },
-            state: "Maharashtra",
-            city: "Pune",
-            facility: "MIT ADT College - SOC",
-            area: "BN",
-            slot: 5,
-            entry: "Main Entrance",
-            time: now - (14 * oneHour), // 14 hours ago (Overtime for Free Tier)
-            endTime: null,
-            fine: 1000,
-            fineReason: "Overtime parking (2.0h)",
-            finePaid: false,
-            userTier: "free",
-            autoFineApplied: 1000
-        },
-        {
-            id: "PKG000002",
-            email: "prathamesh@gmail.com",
-            userName: "Prathamesh",
-            vehicle: { name: "Royal Enfield", number: "MH-12-RE-0007", type: "bike" },
-            state: "Maharashtra",
-            city: "Pune",
-            facility: "Phoenix Marketcity",
-            area: "B1",
-            slot: 12,
-            entry: "North Gate",
-            time: now - (2 * oneHour), // 2 hours ago (Active)
-            endTime: null,
-            fine: 0,
-            finePaid: false,
-            userTier: "free"
-        },
-        {
-            id: "PKG000003",
-            email: "prathamesh@gmail.com",
-            userName: "Prathamesh",
-            vehicle: { name: "Honda City", number: "MH-01-HC-9999", type: "car" },
-            state: "Maharashtra",
-            city: "Mumbai",
-            facility: "R City Mall",
-            area: "O2",
-            slot: 25,
-            entry: "South Gate",
-            time: now - (25 * oneHour),
-            endTime: now - (22 * oneHour), // Completed History
-            fine: 0,
-            finePaid: false,
-            userTier: "premium"
-        }
-    ];
-
-    savedParkings = demoData;
-    localStorage.setItem('sp_parkings', JSON.stringify(savedParkings));
-    localStorage.setItem('sp_counter', 4);
-    console.log("✅ Demo data seeded!");
-}
